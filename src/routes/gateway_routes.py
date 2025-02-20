@@ -5,6 +5,9 @@ import time
 from prometheus_client import Counter, Histogram
 from ..config import Config
 import logging
+import websocket
+from flask_sock import Sock
+import json
 
 # Create logger
 logger = logging.getLogger(__name__)
@@ -12,9 +15,107 @@ logger = logging.getLogger(__name__)
 # Create Blueprint
 gateway_bp = Blueprint('gateway', __name__)
 
+# Initialize Sock with the blueprint
+sock = Sock(gateway_bp)
+
 # Metrics
 REQUEST_COUNT = Counter('gateway_requests_total', 'Total gateway requests', ['service', 'endpoint', 'method', 'status'])
 REQUEST_LATENCY = Histogram('gateway_request_latency_seconds', 'Request latency', ['service', 'endpoint'])
+
+# WebSocket client connections
+ws_clients = {}
+
+def handle_websocket(ws):
+    """Handle WebSocket connections and proxy them to the matching engine"""
+    client_id = id(ws)
+    ws_clients[client_id] = ws
+    
+    logger.info(f"New WebSocket connection established. Client ID: {client_id}")
+    
+    try:
+        # Connect to matching engine WebSocket
+        me_ws = websocket.WebSocket()
+        me_ws_url = f"{Config.MATCHING_ENGINE_URL.replace('http', 'ws')}/ws"
+        logger.debug(f"Connecting to matching engine WebSocket at {me_ws_url}")
+        
+        try:
+            me_ws.connect(
+                me_ws_url,
+                ping_interval=Config.WS_PING_INTERVAL,
+                ping_timeout=Config.WS_PING_TIMEOUT,
+                max_size=Config.WS_MAX_MESSAGE_SIZE
+            )
+            logger.info("Successfully connected to matching engine WebSocket")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to matching engine WebSocket: {str(e)}")
+            ws.send(json.dumps({
+                "type": "error",
+                "message": "Failed to connect to matching engine"
+            }))
+            return
+        
+        while True:
+            try:
+                # Forward messages from client to matching engine
+                message = ws.receive()
+                if message:
+                    logger.debug(f"Received message from client: {message}")
+                    try:
+                        # Parse message to validate JSON
+                        msg_data = json.loads(message)
+                        logger.debug(f"Forwarding message to matching engine: {msg_data}")
+                        me_ws.send(message)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Received invalid JSON from client: {message}")
+                        ws.send(json.dumps({
+                            "type": "error",
+                            "message": "Invalid JSON message"
+                        }))
+                        continue
+                
+                # Forward messages from matching engine to client
+                try:
+                    message = me_ws.recv()
+                    if message:
+                        logger.debug(f"Received message from matching engine: {message}")
+                        try:
+                            # Parse message to validate JSON
+                            msg_data = json.loads(message)
+                            logger.debug(f"Forwarding message to client: {msg_data}")
+                            ws.send(message)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Received invalid JSON from matching engine: {message}")
+                            continue
+                except websocket.WebSocketConnectionClosedException:
+                    logger.warning("WebSocket connection to matching engine closed")
+                    break
+                    
+            except websocket.WebSocketConnectionClosedException:
+                logger.warning("Client WebSocket connection closed")
+                break
+            except Exception as e:
+                logger.error(f"Error in WebSocket communication: {str(e)}")
+                try:
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "message": "Internal communication error"
+                    }))
+                except:
+                    pass
+                break
+                
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+    finally:
+        try:
+            me_ws.close()
+        except:
+            pass
+        
+        if client_id in ws_clients:
+            del ws_clients[client_id]
+        logger.info(f"WebSocket connection closed. Client ID: {client_id}")
 
 # Circuit breaker state
 circuit_breakers = {
@@ -245,4 +346,21 @@ def health():
     return {
         'status': 'healthy' if overall_status else 'degraded',
         'services': services_health
-    }, 200 if overall_status else 503 
+    }, 200 if overall_status else 503
+
+# WebSocket route with CORS
+@sock.route('/ws')
+def ws_route(ws):
+    """WebSocket route with CORS validation"""
+    # Check origin
+    origin = request.headers.get('Origin')
+    if origin not in Config.CORS_ORIGINS:
+        logger.warning(f"Rejected WebSocket connection from unauthorized origin: {origin}")
+        ws.send(json.dumps({
+            "type": "error",
+            "message": "Unauthorized origin"
+        }))
+        ws.close()
+        return
+        
+    handle_websocket(ws) 

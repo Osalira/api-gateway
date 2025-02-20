@@ -38,4 +38,5 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
 # Command to run the Flask app
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "app:create_app()"] 
+# Using gunicorn as production server with WebSocket support
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "--worker-class", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "app:create_app()"] 
