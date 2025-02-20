@@ -1,9 +1,13 @@
-from flask import Blueprint, request, Response, current_app
+from flask import Blueprint, request, Response, current_app, jsonify
 import requests
 from functools import wraps
 import time
 from prometheus_client import Counter, Histogram
 from ..config import Config
+import logging
+
+# Create logger
+logger = logging.getLogger(__name__)
 
 # Create Blueprint
 gateway_bp = Blueprint('gateway', __name__)
@@ -79,6 +83,7 @@ def proxy_request(target_url, include_headers=None):
         if include_headers:
             for header in include_headers:
                 if header in request.headers:
+                    print(f"Forwarding header: {header}")
                     headers[header] = request.headers[header]
         
         # Forward the request
@@ -144,8 +149,56 @@ def auth_proxy(path):
 @check_circuit_breaker('trading')
 def trading_proxy(path):
     """Proxy requests to trading service"""
-    target_url = f"{Config.TRADING_SERVICE_URL}/api/trading/{path}"
-    return proxy_request(target_url, include_headers=['Authorization'])
+    # Log request details
+    logger.debug(f"Trading proxy received request for path: {path}")
+    logger.debug(f"Request method: {request.method}")
+    logger.debug(f"Request headers: {request.headers}")
+    logger.debug(f"Request data: {request.get_json() if request.is_json else None}")
+    
+    # Always append trailing slash for Django
+    normalized_path = path.rstrip('/') + '/'
+    
+    # Construct target URL with trailing slash
+    target_url = f"{Config.SERVICE_REGISTRY['trading']['url']}/api/trading/{normalized_path}"
+    logger.debug(f"Forwarding to target URL: {target_url}")
+    
+    # Forward the Authorization and Content-Type headers
+    headers_to_forward = ['Authorization', 'Content-Type']
+    headers = {}
+    for header in headers_to_forward:
+        if header in request.headers:
+            logger.debug(f"Forwarding header: {header}")
+            headers[header] = request.headers[header]
+    
+    try:
+        # Make the direct request with trailing slash to avoid redirect
+        response = requests.request(
+            method=request.method,  # Preserve original method
+            url=target_url,
+            headers=headers,
+            json=request.get_json() if request.is_json else None,
+            params=request.args,
+            timeout=Config.REQUEST_TIMEOUT
+        )
+        
+        logger.debug(f"Received response status: {response.status_code}")
+        logger.debug(f"Response content: {response.text}")
+        
+        # Return the response with original content type
+        return Response(
+            response.content,
+            status=response.status_code,
+            mimetype=response.headers.get('content-type', 'application/json')
+        )
+    except Exception as e:
+        logger.error(f"Error proxying request to trading service: {str(e)}")
+        return jsonify({
+            'success': False,
+            'data': {
+                'error': 'Failed to proxy request to trading service',
+                'details': str(e)
+            }
+        }), 500
 
 # Matching Engine Routes
 @gateway_bp.route('/matching/<path:path>', methods=['GET', 'POST'])

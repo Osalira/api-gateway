@@ -3,6 +3,7 @@ from flask_cors import CORS
 from prometheus_client import make_wsgi_app
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 import os
 
@@ -20,17 +21,19 @@ def create_app():
     CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=True)
     
     # Configure logging
-    if not os.path.exists('logs'):
-        os.makedirs('logs')
-        
-    handler = RotatingFileHandler(
-        'logs/api_gateway.log',
-        maxBytes=10000000,  # 10MB
-        backupCount=10
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('logs/api_gateway.log')
+        ]
     )
-    handler.setFormatter(logging.Formatter(Config.LOG_FORMAT))
-    app.logger.addHandler(handler)
-    app.logger.setLevel(getattr(logging, Config.LOG_LEVEL))
+    
+    # Set Flask logger to use the same configuration
+    app.logger.handlers = []
+    app.logger.addHandler(logging.StreamHandler(sys.stdout))
+    app.logger.setLevel(logging.DEBUG)
     
     # Register blueprints
     app.register_blueprint(gateway_bp, url_prefix=Config.API_PREFIX)
@@ -42,6 +45,7 @@ def create_app():
     
     @app.route('/health')
     def health_check():
+        app.logger.info("Health check endpoint called")
         return {'status': 'healthy'}, 200
     
     return app
