@@ -6,7 +6,6 @@ from prometheus_client import Counter, Histogram
 from ..config import Config
 import logging
 import websocket
-from flask_sock import Sock
 import json
 
 # Create logger
@@ -14,9 +13,6 @@ logger = logging.getLogger(__name__)
 
 # Create Blueprint
 gateway_bp = Blueprint('gateway', __name__)
-
-# Initialize Sock with the blueprint
-sock = Sock(gateway_bp)
 
 # Metrics
 REQUEST_COUNT = Counter('gateway_requests_total', 'Total gateway requests', ['service', 'endpoint', 'method', 'status'])
@@ -26,96 +22,189 @@ REQUEST_LATENCY = Histogram('gateway_request_latency_seconds', 'Request latency'
 ws_clients = {}
 
 def handle_websocket(ws):
-    """Handle WebSocket connections and proxy them to the matching engine"""
+    """Handle WebSocket connections and message forwarding"""
     client_id = id(ws)
-    ws_clients[client_id] = ws
-    
-    logger.info(f"New WebSocket connection established. Client ID: {client_id}")
+    me_ws = None
+    auth_token = None
     
     try:
-        # Connect to matching engine WebSocket
-        me_ws = websocket.WebSocket()
-        me_ws_url = f"{Config.MATCHING_ENGINE_URL.replace('http', 'ws')}/ws"
-        logger.debug(f"Connecting to matching engine WebSocket at {me_ws_url}")
+        logger.info(f"New WebSocket connection established. Client ID: {client_id}")
         
-        try:
-            me_ws.connect(
-                me_ws_url,
-                ping_interval=Config.WS_PING_INTERVAL,
-                ping_timeout=Config.WS_PING_TIMEOUT,
-                max_size=Config.WS_MAX_MESSAGE_SIZE
-            )
-            logger.info("Successfully connected to matching engine WebSocket")
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to matching engine WebSocket: {str(e)}")
+        # Get and validate protocols
+        requested_protocols = ws.environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL', '').split(',')
+        requested_protocols = [p.strip() for p in requested_protocols if p.strip()]
+        
+        if not requested_protocols or 'trading-protocol' not in requested_protocols:
+            logger.warning(f"Client {client_id} did not request trading-protocol")
             ws.send(json.dumps({
                 "type": "error",
-                "message": "Failed to connect to matching engine"
+                "message": "Protocol 'trading-protocol' is required"
             }))
             return
-        
-        while True:
+
+        # Send initial success message
+        ws.send(json.dumps({
+            "type": "connection",
+            "status": "connecting",
+            "message": "WebSocket connection established with API Gateway"
+        }))
+
+        # Wait for authentication message
+        try:
+            auth_message = ws.receive(timeout=5.0)  # 5 second timeout for auth
+            if not auth_message:
+                logger.warning(f"Client {client_id} did not send authentication message")
+                ws.send(json.dumps({
+                    "type": "error",
+                    "message": "Authentication timeout"
+                }))
+                return
+            
             try:
-                # Forward messages from client to matching engine
-                message = ws.receive()
-                if message:
-                    logger.debug(f"Received message from client: {message}")
-                    try:
-                        # Parse message to validate JSON
-                        msg_data = json.loads(message)
-                        logger.debug(f"Forwarding message to matching engine: {msg_data}")
-                        me_ws.send(message)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Received invalid JSON from client: {message}")
-                        ws.send(json.dumps({
-                            "type": "error",
-                            "message": "Invalid JSON message"
-                        }))
-                        continue
-                
-                # Forward messages from matching engine to client
-                try:
-                    message = me_ws.recv()
-                    if message:
-                        logger.debug(f"Received message from matching engine: {message}")
-                        try:
-                            # Parse message to validate JSON
-                            msg_data = json.loads(message)
-                            logger.debug(f"Forwarding message to client: {msg_data}")
-                            ws.send(message)
-                        except json.JSONDecodeError:
-                            logger.warning(f"Received invalid JSON from matching engine: {message}")
-                            continue
-                except websocket.WebSocketConnectionClosedException:
-                    logger.warning("WebSocket connection to matching engine closed")
-                    break
-                    
-            except websocket.WebSocketConnectionClosedException:
-                logger.warning("Client WebSocket connection closed")
-                break
-            except Exception as e:
-                logger.error(f"Error in WebSocket communication: {str(e)}")
-                try:
+                data = json.loads(auth_message)
+                if data.get('type') != 'auth' or not data.get('token'):
+                    logger.warning(f"Client {client_id} sent invalid authentication message")
                     ws.send(json.dumps({
                         "type": "error",
-                        "message": "Internal communication error"
+                        "message": "Invalid authentication message"
                     }))
-                except:
-                    pass
+                    return
+                auth_token = data['token']
+            except json.JSONDecodeError:
+                logger.warning(f"Client {client_id} sent invalid JSON for authentication")
+                ws.send(json.dumps({
+                    "type": "error",
+                    "message": "Invalid authentication format"
+                }))
+                return
+        except Exception as e:
+            logger.warning(f"Authentication error for client {client_id}: {str(e)}")
+            ws.send(json.dumps({
+                "type": "error",
+                "message": "Authentication failed"
+            }))
+            return
+
+        # Connect to matching engine with retry logic
+        max_retries = 3
+        retry_delay = 1  # seconds
+        me_ws_url = f"ws://{Config.MATCHING_ENGINE_URL.replace('http://', '')}/ws"
+        
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Attempt {attempt + 1}/{max_retries} to connect to matching engine at {me_ws_url}")
+                
+                me_ws = websocket.create_connection(
+                    me_ws_url,
+                    subprotocols=['trading-protocol'],
+                    header={
+                        "Authorization": f"Bearer {auth_token}",
+                        "Origin": ws.environ.get('HTTP_ORIGIN', 'http://localhost:5173')
+                    },
+                    enable_multithread=True,
+                    timeout=10  # 10 second timeout for connection
+                )
+                
+                logger.info(f"Successfully connected to matching engine WebSocket on attempt {attempt + 1}")
+                
+                # Send success message to client
+                ws.send(json.dumps({
+                    "type": "connection",
+                    "status": "ready",
+                    "message": "Connected to trading service"
+                }))
+                
                 break
                 
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}", exc_info=True)
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error("Failed to connect to matching engine after all retries")
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "message": "Failed to connect to trading service",
+                        "details": str(e)
+                    }))
+                    return
+
+        # Message forwarding loop with improved error handling
+        last_ping_time = time.time()
+        ping_interval = 30  # seconds
+        
+        while not ws.closed and not (me_ws and me_ws.closed):
+            try:
+                # Send ping if needed
+                current_time = time.time()
+                if current_time - last_ping_time >= ping_interval:
+                    ws.send(json.dumps({"type": "ping"}))
+                    last_ping_time = current_time
+                
+                # Handle client messages with timeout
+                try:
+                    message = ws.receive(timeout=1.0)
+                    if message:
+                        try:
+                            data = json.loads(message)
+                            if data.get('type') == 'pong':
+                                continue
+                            me_ws.send(message)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Received invalid JSON from client: {message}")
+                            continue
+                except Exception as e:
+                    if "timed out" not in str(e).lower():
+                        raise
+
+                # Handle matching engine messages with timeout
+                if me_ws and me_ws.connected:
+                    try:
+                        me_ws.settimeout(0.1)
+                        response = me_ws.recv()
+                        if response:
+                            ws.send(response)
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error receiving from matching engine: {str(e)}")
+                        break
+
+            except Exception as e:
+                if "timed out" not in str(e).lower():
+                    logger.error(f"Error in message forwarding loop: {str(e)}")
+                    break
+
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-    finally:
+        logger.error(f"WebSocket error for client {client_id}: {str(e)}", exc_info=True)
         try:
-            me_ws.close()
+            if not ws.closed:
+                ws.send(json.dumps({
+                    "type": "error",
+                    "message": "Internal server error",
+                    "details": str(e)
+                }))
         except:
             pass
+            
+    finally:
+        logger.info(f"Cleaning up WebSocket connection for client {client_id}")
+        if me_ws:
+            try:
+                me_ws.close()
+                logger.debug("Closed matching engine connection")
+            except Exception as e:
+                logger.error(f"Error closing matching engine connection: {str(e)}")
         
-        if client_id in ws_clients:
-            del ws_clients[client_id]
-        logger.info(f"WebSocket connection closed. Client ID: {client_id}")
+        if not ws.closed:
+            try:
+                ws.close()
+                logger.debug("Closed client connection")
+            except Exception as e:
+                logger.error(f"Error closing client connection: {str(e)}")
+                
+        logger.info("WebSocket cleanup complete")
 
 # Circuit breaker state
 circuit_breakers = {
@@ -346,21 +435,4 @@ def health():
     return {
         'status': 'healthy' if overall_status else 'degraded',
         'services': services_health
-    }, 200 if overall_status else 503
-
-# WebSocket route with CORS
-@sock.route('/ws')
-def ws_route(ws):
-    """WebSocket route with CORS validation"""
-    # Check origin
-    origin = request.headers.get('Origin')
-    if origin not in Config.CORS_ORIGINS:
-        logger.warning(f"Rejected WebSocket connection from unauthorized origin: {origin}")
-        ws.send(json.dumps({
-            "type": "error",
-            "message": "Unauthorized origin"
-        }))
-        ws.close()
-        return
-        
-    handle_websocket(ws) 
+    }, 200 if overall_status else 503 

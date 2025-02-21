@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, request
 from flask_cors import CORS
 from prometheus_client import make_wsgi_app
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
@@ -8,6 +8,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 import os
 import json
+from geventwebsocket.handler import WebSocketHandler
+from gevent.pywsgi import WSGIServer
 
 from src.routes.gateway_routes import gateway_bp, handle_websocket
 from src.config import Config
@@ -19,26 +21,30 @@ def create_app():
     # Load configuration
     app.config.from_object(Config)
     
+    # Initialize WebSocket support first
+    sock = Sock(app)
+    
     # Configure CORS with WebSocket support
     CORS(app, 
          origins=Config.CORS_ORIGINS,
          supports_credentials=True,
          allow_headers=['*'],
          expose_headers=['*'],
-         allow_methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+         methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
          resources={
              r"/*": {"origins": Config.CORS_ORIGINS},
-             r"/ws": {"origins": Config.CORS_ORIGINS}
-         },
-         allow_private_network=True)
-    
-    # Initialize WebSocket support with custom settings
-    sock = Sock(app)
-    app.sock = sock  # Store for use in routes
+             r"/ws": {  # Changed from /ws/* to /ws
+                 "origins": Config.CORS_ORIGINS,
+                 "allow_headers": ["*"],
+                 "methods": ["GET", "OPTIONS", "UPGRADE", "CONNECTION"]  # Added UPGRADE and CONNECTION
+             }
+         })
     
     # Configure WebSocket specific settings
     app.config['SOCK_SERVER_OPTIONS'] = {
-        'max_message_size': Config.WS_MAX_MESSAGE_SIZE
+        'ping_interval': 25,  # Send ping every 25 seconds
+        'ping_timeout': 10,   # Wait 10 seconds for pong
+        'subprotocols': ['trading-protocol']
     }
     
     # Configure logging with more detailed WebSocket logs
@@ -61,11 +67,23 @@ def create_app():
     ws_logger.setLevel(logging.DEBUG)
     ws_logger.addHandler(logging.StreamHandler(sys.stdout))
     
-    # Register WebSocket route at root level
+    # Register WebSocket route before other routes
     @sock.route('/ws')
     def ws_handler(ws):
-        app.logger.info("WebSocket connection received at root level")
-        return handle_websocket(ws)
+        """Handle WebSocket connections"""
+        try:
+            # Get and validate origin
+            origin = request.headers.get('Origin', '')
+            app.logger.info(f"WebSocket connection received from origin: {origin}")
+            
+            if origin not in Config.CORS_ORIGINS:
+                app.logger.warning(f"Rejected WebSocket connection from unauthorized origin: {origin}")
+                return
+            
+            handle_websocket(ws)
+            
+        except Exception as e:
+            app.logger.error(f"WebSocket error: {str(e)}", exc_info=True)
     
     # Register blueprints for HTTP routes
     app.register_blueprint(gateway_bp, url_prefix=Config.API_PREFIX)
@@ -84,7 +102,5 @@ def create_app():
 
 if __name__ == '__main__':
     app = create_app()
-    
-    # Start server with WebSocket support
-    port = int(os.getenv('PORT', 4000))
-    app.run(host='0.0.0.0', port=port, debug=True) 
+    http_server = WSGIServer(('0.0.0.0', 4000), app, handler_class=WebSocketHandler)
+    http_server.serve_forever() 
