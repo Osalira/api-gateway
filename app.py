@@ -1,92 +1,49 @@
-from flask import Flask, request
-from flask_cors import CORS
-from prometheus_client import make_wsgi_app
-from werkzeug.middleware.dispatcher import DispatcherMiddleware
-from flask_sock import Sock
-import logging
-import sys
-from logging.handlers import RotatingFileHandler
 import os
+import time
+import logging
 import json
-from geventwebsocket.handler import WebSocketHandler
-from gevent.pywsgi import WSGIServer
-
-from src.routes.gateway_routes import gateway_bp, handle_websocket
+import sys
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+from flask_sock import Sock
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from prometheus_client import make_wsgi_app
+import requests
 from src.config import Config
+from src.routes.gateway_routes import gateway_bp, handle_websocket
+from src.routes.jmeter_routes import jmeter_bp
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 def create_app():
     """Initialize and configure the Flask application"""
     app = Flask(__name__)
     
-    # Load configuration
+    # Load configuration from the Config class
     app.config.from_object(Config)
     
-    # Initialize WebSocket support first
+    # Set up CORS with WebSocket support
+    CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=True)
+    
+    # Set up WebSockets
     sock = Sock(app)
     
-    # Configure CORS with WebSocket support
-    CORS(app, 
-         origins=Config.CORS_ORIGINS,
-         supports_credentials=True,
-         allow_headers=['*'],
-         expose_headers=['*'],
-         methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-         resources={
-             r"/*": {"origins": Config.CORS_ORIGINS},
-             r"/ws": {  # Changed from /ws/* to /ws
-                 "origins": Config.CORS_ORIGINS,
-                 "allow_headers": ["*"],
-                 "methods": ["GET", "OPTIONS", "UPGRADE", "CONNECTION"]  # Added UPGRADE and CONNECTION
-             }
-         })
-    
-    # Configure WebSocket specific settings
-    app.config['SOCK_SERVER_OPTIONS'] = {
-        'ping_interval': 25,  # Send ping every 25 seconds
-        'ping_timeout': 10,   # Wait 10 seconds for pong
-        'subprotocols': ['trading-protocol']
-    }
-    
-    # Configure logging with more detailed WebSocket logs
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('logs/api_gateway.log')
-        ]
-    )
-    
-    # Set Flask logger to use the same configuration
-    app.logger.handlers = []
-    app.logger.addHandler(logging.StreamHandler(sys.stdout))
-    app.logger.setLevel(logging.DEBUG)
-    
-    # Add WebSocket specific logger
-    ws_logger = logging.getLogger('websocket')
-    ws_logger.setLevel(logging.DEBUG)
-    ws_logger.addHandler(logging.StreamHandler(sys.stdout))
-    
-    # Register WebSocket route before other routes
+    # Register the WebSocket route
     @sock.route('/ws')
     def ws_handler(ws):
-        """Handle WebSocket connections"""
-        try:
-            # Get and validate origin
-            origin = request.headers.get('Origin', '')
-            app.logger.info(f"WebSocket connection received from origin: {origin}")
-            
-            if origin not in Config.CORS_ORIGINS:
-                app.logger.warning(f"Rejected WebSocket connection from unauthorized origin: {origin}")
-                return
-            
-            handle_websocket(ws)
-            
-        except Exception as e:
-            app.logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+        handle_websocket(ws)
     
-    # Register blueprints for HTTP routes
+    # Register the gateway blueprint for HTTP routes (API routes)
     app.register_blueprint(gateway_bp, url_prefix=Config.API_PREFIX)
+    
+    # Register the JMeter routes blueprint for direct access without API prefix
+    app.register_blueprint(jmeter_bp)
     
     # Add Prometheus metrics endpoint
     app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
@@ -98,9 +55,30 @@ def create_app():
         app.logger.info("Health check endpoint called")
         return {'status': 'healthy'}, 200
     
+    @app.route('/debug/routes')
+    def debug_routes():
+        """Debug endpoint to list all registered routes"""
+        app.logger.info("Debug routes endpoint called")
+        
+        # Get all registered routes
+        routes = []
+        for rule in app.url_map.iter_rules():
+            routes.append({
+                'endpoint': rule.endpoint,
+                'methods': list(rule.methods),
+                'rule': str(rule)
+            })
+        
+        # Log all routes for debugging
+        app.logger.info(f"Registered routes: {routes}")
+        return {'routes': routes}, 200
+    
     return app
 
+# Create app instance for gunicorn
+app = create_app()
+
 if __name__ == '__main__':
+    # This server is WebSocket-capable for local development
     app = create_app()
-    http_server = WSGIServer(('0.0.0.0', 4000), app, handler_class=WebSocketHandler)
-    http_server.serve_forever() 
+    app.run(host='0.0.0.0', port=5000, debug=True) 
