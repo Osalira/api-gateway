@@ -141,6 +141,9 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         url = f"{service_url}{path}"
         logger.info(f"Forwarding {method} request to {url}")
         
+        # Add detailed path debugging
+        logger.debug(f"Path details - Original path: {path}")
+        
         # Prepare headers
         if headers is None:
             headers = {}
@@ -149,12 +152,23 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         if 'Host' in headers:
             del headers['Host']
             
-        # Ensure proper content type headers for Django
-        # Check for both /api/ and api/ formats to be safe
-        if 'api/transaction/' in path or 'api/setup/' in path:
-            # Force application/json content-type for Django
+        # Extract service host from the service_url
+        service_host = service_url.replace('http://', '').replace('https://', '')
+        # Set the host header properly for Django's host validation
+        headers['Host'] = service_host
+        logger.debug(f"Setting Host header to: {service_host}")
+            
+        # Ensure proper content type headers for Django based on request method
+        if method in ['POST', 'PUT', 'PATCH']:
+            # Force application/json content-type for Django for methods with a body
             headers['Content-Type'] = 'application/json'
             headers['Accept'] = 'application/json'
+        elif method == 'GET':
+            # For GET requests, we should still accept JSON but not set Content-Type
+            headers['Accept'] = 'application/json'
+            # Remove Content-Type for GET requests to avoid confusion
+            if 'Content-Type' in headers:
+                del headers['Content-Type']
             
         # Handle JWT token authentication formats
         token = None
@@ -162,8 +176,8 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         # Extract token from Authorization header with Bearer prefix
         if 'Authorization' in headers and headers['Authorization'].startswith('Bearer '):
             token = headers['Authorization'].split('Bearer ')[1]
-            # Don't modify the Authorization header as it's already properly formatted
-            # But also add token header for services that expect it
+            # Keep the Authorization header as it's already properly formatted
+            # Also add token header for services that expect it
             headers['token'] = token
             logger.debug("Found and extracted token from Authorization header")
             
@@ -173,31 +187,52 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             # Add the token to Authorization header for services that expect that format
             headers['Authorization'] = f"Bearer {token}"
             logger.debug("Found token in token header, added to Authorization header")
+        
+        if token:
+            logger.debug(f"Using token (first 10 chars): {token[:10]}...")
             
         # Add detailed debugging for headers
+        logger.debug("Request headers being sent:")
         for key, value in headers.items():
             # Only show first/last 10 chars of long values like tokens
             value_log = value
             if len(value) > 30 and (key.lower() == 'authorization' or key.lower() == 'token'):
                 value_log = f"{value[:10]}...{value[-10:]}"
-            logger.debug(f"Header: {key}: {value_log}")
+            logger.debug(f"  {key}: {value_log}")
             
-        # Log the request headers and data for debugging
-        logger.debug(f"Request data: {data}")
+        # Log the request data for debugging
+        if data:
+            logger.debug(f"Request data: {data}")
             
-        # Forward the request to the service
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=headers,
-            json=data,  # Use json parameter for JSON data
-            params=params,
-            timeout=REQUEST_TIMEOUT
-        )
+        # Forward the request to the service, handling GET requests differently
+        if method == 'GET':
+            logger.debug(f"Sending GET request without body data")
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+        else:
+            logger.debug(f"Sending {method} request with JSON data")
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=data,  # Use json parameter for JSON data on non-GET requests
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
         
         # Log the response
         logger.info(f"Response from {url}: {response.status_code}")
         logger.debug(f"Response headers: {response.headers}")
+        
+        # Log more details on error responses
+        if response.status_code >= 400:
+            logger.error(f"Error response from {url}: {response.status_code}")
+            logger.error(f"Response body: {response.text[:200]}...")
         
         # Try to parse the response as JSON
         try:
@@ -226,6 +261,8 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         }), 503
     except Exception as e:
         logger.error(f"Error forwarding request to {service_url}{path}: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({
             "success": False,
             "data": {"error": f"Internal server error: {str(e)}"}
@@ -262,26 +299,36 @@ def transaction_service_proxy(path):
     headers = dict(request.headers)
     if hasattr(request, 'user_id'):
         headers['user_id'] = str(request.user_id)
+        logger.debug(f"Added user_id header: {request.user_id}")
     
     # Handle data appropriately based on request method
     data = None
     if request.method in ['POST', 'PUT'] and request.is_json:
         data = request.get_json()
+        logger.debug(f"JSON data for request: {data}")
     
-    # For GET requests, ensure we don't send a body
+    # For GET requests, ensure we don't send a body and use params instead
     params = request.args
     if request.method == 'GET':
         data = None
+        logger.debug("GET request - using query params only, no body data")
     
-    # Make sure we're using the correct URL format for Django
-    # Django API endpoints include 'api/' in the URL path
-    django_path = path
-    if not path.startswith('api/'):
-        django_path = f"api/transaction/{path}"
+    # Construct the Django path correctly
+    django_path = f"/api/transaction/{path}"
+    
+    logger.debug(f"Original path: {path}, transformed path for Django: {django_path}")
+    
+    # Always include trailing slash for Django
+    if not django_path.endswith('/'):
+        django_path = f"{django_path}/"
+        logger.debug(f"Added trailing slash for Django compatibility: {django_path}")
+    
+    logger.debug(f"Final path for Django: {django_path}")
+    logger.debug(f"Headers being sent: {str({k: v for k, v in headers.items() if k.lower() not in ['authorization', 'token']})}")
     
     return forward_request(
         service_url=TRADING_SERVICE_URL,
-        path=f"/{django_path}",
+        path=django_path,
         method=request.method,
         headers=headers,
         data=data,
@@ -339,6 +386,7 @@ def setup_service_proxy(path):
     headers = dict(request.headers)
     if hasattr(request, 'user_id'):
         headers['user_id'] = str(request.user_id)
+        logger.debug(f"Added user_id header: {request.user_id}")
     
     # Handle data appropriately based on request method
     data = None
@@ -353,12 +401,18 @@ def setup_service_proxy(path):
     # Make sure we're using the correct URL format for Django
     # Django API endpoints include 'api/' in the URL path
     django_path = path
-    if not path.startswith('api/'):
+    if not django_path.startswith('api/'):
         django_path = f"api/setup/{path}"
+    
+    # Ensure the path starts with a slash
+    if not django_path.startswith('/'):
+        django_path = f"/{django_path}"
+    
+    logger.debug(f"Transformed path for Django: {django_path}")
     
     return forward_request(
         service_url=TRADING_SERVICE_URL,
-        path=f"/{django_path}",
+        path=django_path,
         method=request.method,
         headers=headers,
         data=data,
@@ -398,6 +452,133 @@ def logging_service_proxy(path):
         headers=headers,
         data=data,
         params=params
+    )
+
+# Debug endpoint to test token handling
+@app.route('/debug/auth', methods=['GET'])
+def debug_auth():
+    """
+    Debug endpoint to verify token handling in the API Gateway
+    Returns information about the request and any tokens found
+    """
+    import traceback
+    
+    # Create response data with request information
+    response_data = {
+        "message": "Debug authentication information",
+        "headers": {},
+        "tokens": {},
+        "request": {
+            "path": request.path,
+            "method": request.method,
+            "query_params": dict(request.args),
+        }
+    }
+    
+    # Add relevant headers to response
+    for key, value in request.headers.items():
+        # Mask token values
+        if key.lower() in ['authorization', 'token']:
+            if len(value) > 20:
+                value = f"{value[:10]}...{value[-10:]}"
+        response_data['headers'][key] = value
+    
+    # Extract token information
+    try:
+        # Check for token in Authorization header
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            response_data['tokens']['authorization_header'] = auth_header
+            
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split('Bearer ')[1]
+                response_data['tokens']['bearer_token'] = f"{token[:10]}...{token[-10:]}"
+                
+                # Try to decode JWT (without verification)
+                try:
+                    import jwt
+                    decoded = jwt.decode(token, options={"verify_signature": False})
+                    response_data['tokens']['decoded_jwt'] = {
+                        "headers": decoded.get('header', {}),
+                        "claims": {k: v for k, v in decoded.items() if k != 'sub'},
+                        "subject": decoded.get('sub', {})
+                    }
+                except Exception as e:
+                    response_data['tokens']['jwt_decode_error'] = str(e)
+        
+        # Check for token in token header
+        if 'token' in request.headers:
+            token = request.headers['token']
+            response_data['tokens']['token_header'] = f"{token[:10]}...{token[-10:]}"
+            
+            # Try to decode JWT (without verification)
+            try:
+                import jwt
+                decoded = jwt.decode(token, options={"verify_signature": False})
+                response_data['tokens']['token_decoded_jwt'] = {
+                    "headers": decoded.get('header', {}),
+                    "claims": {k: v for k, v in decoded.items() if k != 'sub'},
+                    "subject": decoded.get('sub', {})
+                }
+            except Exception as e:
+                response_data['tokens']['token_jwt_decode_error'] = str(e)
+                
+    except Exception as e:
+        logger.error(f"Error in debug_auth: {str(e)}")
+        logger.error(traceback.format_exc())
+        response_data['error'] = str(e)
+    
+    logger.info(f"Debug auth request from: {request.remote_addr}")
+    
+    return jsonify(response_data)
+
+# Debug routes for trading service
+@app.route('/trading/debug/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def trading_debug_proxy(path):
+    """
+    Proxy requests to the debug endpoints in the trading service
+    These endpoints don't require authentication
+    """
+    # Log the debug request
+    logger.info(f"Trading debug request: {request.method} {path}")
+    
+    # Create a copy of the headers
+    headers = dict(request.headers)
+    
+    # If no token is present but needed for testing, use a dummy token
+    if 'Authorization' not in headers and 'token' not in headers:
+        logger.debug("No token found, adding dummy 'test' token for debugging")
+        headers['token'] = "test"
+    
+    # Make sure we're using the correct URL format for Django
+    # For debug endpoints, path should be 'auth' not 'debug/auth' since we're already at '/api/debug/'
+    django_path = f"/api/debug/{path}"
+    
+    logger.debug(f"Original path: {path}, transformed path for Django: {django_path}")
+    
+    # For GET requests, ensure we don't send a body
+    data = None
+    if request.method != 'GET' and request.is_json:
+        data = request.get_json()
+        logger.debug(f"Request has JSON data: {data}")
+    else:
+        logger.debug("GET request - no body data will be sent")
+    
+    logger.debug(f"Proxying to trading service debug endpoint: {django_path} with method {request.method}")
+    logger.debug(f"Headers being sent: {str({k: v for k, v in headers.items() if k.lower() not in ['authorization', 'token']})}")
+    
+    # Always include trailing slash for Django
+    if not django_path.endswith('/'):
+        django_path = f"{django_path}/"
+        logger.debug(f"Added trailing slash for Django compatibility: {django_path}")
+    
+    return forward_request(
+        service_url=TRADING_SERVICE_URL,
+        path=django_path,
+        method=request.method,
+        headers=headers,
+        data=data,
+        params=request.args
     )
 
 # Catch-all route for 404s
