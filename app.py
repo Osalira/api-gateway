@@ -237,11 +237,18 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         # Try to parse the response as JSON
         try:
             json_data = response.json()
-            # Format the response to match JMeter expectations
-            return jsonify({
-                "success": response.status_code < 400,
-                "data": json_data
-            }), response.status_code
+            
+            # Check if this response already has the correct structure
+            if service_url == AUTH_SERVICE_URL and 'success' in json_data and 'data' in json_data:
+                # For authentication service responses, preserve the original structure 
+                # (particularly important for JMeter tests)
+                return jsonify(json_data), response.status_code
+            else:
+                # For other services, format the response to match JMeter expectations
+                return jsonify({
+                    "success": response.status_code < 400,
+                    "data": json_data
+                }), response.status_code
         except ValueError:
             # Response is not JSON, return it as is
             logger.warning(f"Non-JSON response from {url}: {response.text[:200]}")
