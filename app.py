@@ -375,10 +375,6 @@ def engine_service_proxy(path):
 @app.route('/setup/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @token_required
 def setup_service_proxy(path):
-    # Verify admin privileges
-    if not hasattr(request, 'account_type') or request.account_type != 'admin':
-        return jsonify({"success": False, "error": "Admin privileges required"}), 403
-    
     # Log the setup request
     logger.info(f"Setup request: {request.method} {path}")
     
@@ -423,10 +419,6 @@ def setup_service_proxy(path):
 @app.route('/logs/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @token_required
 def logging_service_proxy(path):
-    # Verify admin privileges
-    if not hasattr(request, 'account_type') or request.account_type != 'admin':
-        return jsonify({"success": False, "error": "Admin privileges required"}), 403
-    
     # Log the logging request
     logger.info(f"Logging request: {request.method} {path}")
     
