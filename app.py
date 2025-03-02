@@ -168,12 +168,6 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             headers['HTTP_USER_ID'] = str(request.user_id)
             headers['user_id'] = str(request.user_id)
             
-            # Also include username if available
-            if hasattr(request, 'username') and request.username:
-                headers['HTTP_USERNAME'] = request.username
-                headers['username'] = request.username
-                logger.debug(f"Added username={request.username} to headers")
-            
             # For GET requests, also include in query parameters if not already there
             if method == 'GET' and params is not None:
                 params = dict(params) if params else {}
@@ -343,12 +337,6 @@ def transaction_service_proxy(path):
         headers['user_id'] = str(request.user_id)
         headers['HTTP_USER_ID'] = str(request.user_id)
         logger.debug(f"Added user_id header: {request.user_id}")
-        
-        # Also include username if available
-        if hasattr(request, 'username') and request.username:
-            headers['HTTP_USERNAME'] = request.username
-            headers['username'] = request.username
-            logger.debug(f"Added username header: {request.username}")
     
     # Handle data appropriately based on request method
     data = None
@@ -370,12 +358,6 @@ def transaction_service_proxy(path):
             params = dict(params)
             params['user_id'] = str(request.user_id)
             logger.debug(f"Added user_id to query parameters: {request.user_id}")
-            
-            # Also add username if available
-            if hasattr(request, 'username') and request.username:
-                params['username'] = request.username
-                params['user_name'] = request.username
-                logger.debug(f"Added username/user_name to query parameters: {request.username}")
         logger.debug("GET request - using query params only, no body data")
     
     # Construct the Django path correctly
