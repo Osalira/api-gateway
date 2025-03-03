@@ -407,6 +407,14 @@ def engine_service_proxy(path):
             data['user_id'] = request.user_id
             logger.debug(f"Added user_id to request body: {request.user_id}")
         
+        # Special handling for cancel stock transaction
+        # The frontend/JMeter sends stock_tx_id but the matching engine expects transaction_id
+        if path == 'cancelStockTransaction' and data and 'stock_tx_id' in data and 'transaction_id' not in data:
+            data['transaction_id'] = data['stock_tx_id']
+            logger.debug(f"Translated stock_tx_id ({data['stock_tx_id']}) to transaction_id for matching engine compatibility")
+            # Optionally remove the original parameter to avoid confusion
+            data.pop('stock_tx_id')
+        
         # Convert string stock_id to integer for the matching engine
         # This handles the case where JMeter tests use the empty string stock_id
         # format from our portfolio response but the matching engine needs integers
