@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import logging
 import os
 from dotenv import load_dotenv
@@ -36,18 +38,46 @@ TRADING_SERVICE_URL = os.getenv('TRADING_SERVICE_URL', 'http://trading-service:8
 MATCHING_ENGINE_URL = os.getenv('MATCHING_ENGINE_URL', 'http://matching-engine:8080')
 LOGGING_SERVICE_URL = os.getenv('LOGGING_SERVICE_URL', 'http://logging-service:5000')
 
-# Request timeout
-REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 30))
+# Request timeout - Increased for high load scenarios
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 60))
 
 # Rate limiting settings
 RATE_LIMIT_ENABLED = os.getenv('RATE_LIMIT_ENABLED', 'True').lower() == 'true'
-RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', 100))
+RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', 500))  # Increased from 100
 RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', 60))
 
 # Circuit breaker settings
 CIRCUIT_BREAKER_ENABLED = os.getenv('CIRCUIT_BREAKER_ENABLED', 'True').lower() == 'true'
-CIRCUIT_BREAKER_THRESHOLD = int(os.getenv('CIRCUIT_BREAKER_THRESHOLD', 5))
-CIRCUIT_BREAKER_TIMEOUT = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT', 60))
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv('CIRCUIT_BREAKER_THRESHOLD', 10))  # Increased from 5
+CIRCUIT_BREAKER_TIMEOUT = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT', 120))  # Increased from 60
+
+# Configure request session with connection pooling and retry logic
+def create_requests_session():
+    session = requests.Session()
+    
+    # Configure retries
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        method_whitelist=["GET", "POST", "PUT", "DELETE", "PATCH"]
+    )
+    
+    # Configure connection pooling
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=100,  # Number of connection pools
+        pool_maxsize=1000      # Max connections per pool
+    )
+    
+    # Mount the adapter for both http and https
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+# Create a reusable session
+http_session = create_requests_session()
 
 # Authorization middleware that delegates token validation to Auth Service
 def token_required(f):
@@ -231,10 +261,10 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         if data:
             logger.debug(f"Request data: {data}")
             
-        # Forward the request to the service, handling GET requests differently
+        # Forward the request using our optimized session with connection pooling
         if method == 'GET':
             logger.debug(f"Sending GET request without body data")
-            response = requests.request(
+            response = http_session.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -243,7 +273,7 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             )
         else:
             logger.debug(f"Sending {method} request with JSON data")
-            response = requests.request(
+            response = http_session.request(
                 method=method,
                 url=url,
                 headers=headers,
