@@ -10,13 +10,16 @@ import json
 from functools import wraps
 from datetime import datetime
 import time
+import threading
+import uuid
+from rabbitmq import publish_event, start_consumer
 
 # Load environment variables
 load_dotenv()
 
 # Configure basic logging first (will be enhanced after app creation)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("logs/api_gateway.log"),
@@ -27,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Create Flask app - MOVED UP before any app references
 app = Flask(__name__)
-app.logger.setLevel(logging.DEBUG)
+app.logger.setLevel(logging.INFO)
 
 # Configure CORS
 CORS(app)
@@ -51,6 +54,14 @@ CIRCUIT_BREAKER_ENABLED = os.getenv('CIRCUIT_BREAKER_ENABLED', 'True').lower() =
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv('CIRCUIT_BREAKER_THRESHOLD', 10))  # Increased from 5
 CIRCUIT_BREAKER_TIMEOUT = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT', 120))  # Increased from 60
 
+# Service health tracking
+service_health = {
+    'auth-service': {'healthy': True, 'last_checked': datetime.now().isoformat(), 'failures': 0},
+    'trading-service': {'healthy': True, 'last_checked': datetime.now().isoformat(), 'failures': 0},
+    'matching-engine': {'healthy': True, 'last_checked': datetime.now().isoformat(), 'failures': 0},
+    'logging-service': {'healthy': True, 'last_checked': datetime.now().isoformat(), 'failures': 0}
+}
+
 # Configure request session with connection pooling and retry logic
 def create_requests_session():
     session = requests.Session()
@@ -60,7 +71,7 @@ def create_requests_session():
         total=3,
         backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        method_whitelist=["GET", "POST", "PUT", "DELETE", "PATCH"]
+        allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
     )
     
     # Configure connection pooling
@@ -78,6 +89,155 @@ def create_requests_session():
 
 # Create a reusable session
 http_session = create_requests_session()
+
+# Function to start the service health check thread
+def delayed_start_health_check():
+    """Start the health check thread after a short delay"""
+    def delayed_start():
+        time.sleep(5)  # Wait 5 seconds for app to fully initialize
+        try:
+            start_health_check_thread()
+            logger.info("Health check thread started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start health check thread: {str(e)}")
+    
+    thread = threading.Thread(target=delayed_start)
+    thread.daemon = True
+    thread.start()
+
+# Function to start event consumers after a short delay
+def delayed_start_event_consumers():
+    """Start the RabbitMQ consumers after a short delay"""
+    def delayed_start():
+        time.sleep(10)  # Wait 10 seconds for app to fully initialize
+        try:
+            start_event_consumers()
+            logger.info("RabbitMQ consumers started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start RabbitMQ consumers: {str(e)}")
+    
+    thread = threading.Thread(target=delayed_start)
+    thread.daemon = True
+    thread.start()
+
+# Start a service health check thread
+def start_health_check_thread():
+    """Start a background thread to periodically check service health"""
+    def health_check_worker():
+        while True:
+            try:
+                # Check health of each service
+                check_service_health('auth-service', f"{AUTH_SERVICE_URL}/health")
+                check_service_health('trading-service', f"{TRADING_SERVICE_URL}/health")
+                check_service_health('matching-engine', f"{MATCHING_ENGINE_URL}/health")
+                check_service_health('logging-service', f"{LOGGING_SERVICE_URL}/health")
+                
+                # Publish system health event
+                publish_event('system_events', 'system.health', {
+                    'event_type': 'system.health',
+                    'timestamp': datetime.now().isoformat(),
+                    'services': service_health
+                })
+                
+                # Sleep for 30 seconds before next check
+                time.sleep(30)
+            except Exception as e:
+                logger.error(f"Error in health check thread: {str(e)}")
+                time.sleep(10)  # Sleep a bit and try again
+    
+    # Start the thread
+    health_thread = threading.Thread(target=health_check_worker)
+    health_thread.daemon = True
+    health_thread.start()
+    logger.info("Started service health check thread")
+
+def check_service_health(service_name, health_url):
+    """Check health of a specific service"""
+    try:
+        response = http_session.get(health_url, timeout=5)
+        
+        # Update service health status
+        was_healthy = service_health[service_name]['healthy']
+        is_healthy = response.status_code == 200
+        
+        service_health[service_name] = {
+            'healthy': is_healthy,
+            'last_checked': datetime.now().isoformat(),
+            'failures': 0 if is_healthy else service_health[service_name]['failures'] + 1,
+            'status_code': response.status_code
+        }
+        
+        # If service was down but is now up, publish recovery event
+        if not was_healthy and is_healthy:
+            publish_event('system_events', 'system.service_recovered', {
+                'event_type': 'system.service_recovered',
+                'service': service_name,
+                'timestamp': datetime.now().isoformat()
+            })
+            logger.info(f"Service {service_name} has recovered")
+            
+        # If service just went down, publish failure event
+        elif was_healthy and not is_healthy:
+            publish_event('system_events', 'system.service_failed', {
+                'event_type': 'system.service_failed',
+                'service': service_name,
+                'timestamp': datetime.now().isoformat(),
+                'status_code': response.status_code
+            })
+            logger.error(f"Service {service_name} is DOWN - Status code: {response.status_code}")
+            
+    except Exception as e:
+        # Connection error or timeout
+        service_health[service_name] = {
+            'healthy': False,
+            'last_checked': datetime.now().isoformat(),
+            'failures': service_health[service_name]['failures'] + 1,
+            'error': str(e)
+        }
+        
+        # Publish event if this is a new failure
+        if service_health[service_name]['failures'] <= 1:
+            publish_event('system_events', 'system.service_failed', {
+                'event_type': 'system.service_failed',
+                'service': service_name,
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            })
+            logger.error(f"Service {service_name} is DOWN - Error: {str(e)}")
+
+# Event handlers for RabbitMQ consumers
+def handle_system_events(event):
+    """Handle system events"""
+    event_type = event.get('event_type')
+    
+    if event_type == 'system.error':
+        service = event.get('service')
+        error = event.get('error')
+        operation = event.get('operation', 'unknown')
+        trace_id = event.get('trace_id', 'unknown')
+        
+        logger.error(f"[TraceID: {trace_id}] System error in {service}.{operation}: {error}")
+    
+    elif event_type == 'system.metric':
+        # Process system metrics
+        service = event.get('service')
+        metric_name = event.get('metric_name')
+        metric_value = event.get('metric_value')
+        
+        logger.info(f"System metric: {service}.{metric_name} = {metric_value}")
+
+def start_event_consumers():
+    """Start RabbitMQ event consumers"""
+    # Start consumer for system events
+    logger.info("Starting system events consumer")
+    start_consumer(
+        queue_name='api_gateway_system_events',
+        routing_keys=['system.error', 'system.metric', 'system.notification'],
+        exchange='system_events',
+        callback=handle_system_events
+    )
+    
+    logger.info("Event consumers started successfully")
 
 # Authorization middleware that delegates token validation to Auth Service
 def token_required(f):
@@ -100,7 +260,7 @@ def token_required(f):
         
         try:
             # Call Auth Service to validate token
-            response = requests.post(
+            response = http_session.post(
                 f"{AUTH_SERVICE_URL}/authentication/validate-token",
                 headers={"Content-Type": "application/json"},
                 json={"token": token},
@@ -125,58 +285,113 @@ def token_required(f):
             request.username = user_info.get('username')
             request.account_type = user_info.get('account_type')
             
+            # Publish login event (only once per minute per user to avoid flooding)
+            user_id = user_info.get('id')
+            if user_id:
+                cache_key = f"login_event_{user_id}"
+                last_login_event = getattr(app, cache_key, None)
+                current_time = time.time()
+                
+                # Only publish if we haven't published in the last minute
+                if not last_login_event or current_time - last_login_event > 60:
+                    setattr(app, cache_key, current_time)
+                    
+                    # Publish login event asynchronously
+                    threading.Thread(target=publish_login_event, args=(user_info,)).start()
+            
             return f(*args, **kwargs)
             
         except requests.exceptions.Timeout:
-            return jsonify({'success': False, 'error': 'Authentication service timeout'}), 504
+            logger.error("Timeout when validating token with auth service")
+            # Update service health
+            service_health['auth-service']['healthy'] = False
+            service_health['auth-service']['failures'] += 1
+            
+            return jsonify({'success': False, 'error': 'Authentication service timeout'}), 503
+            
         except requests.exceptions.ConnectionError:
+            logger.error("Connection error when validating token with auth service")
+            # Update service health
+            service_health['auth-service']['healthy'] = False
+            service_health['auth-service']['failures'] += 1
+            
             return jsonify({'success': False, 'error': 'Authentication service unavailable'}), 503
+            
         except Exception as e:
-            return jsonify({'success': False, 'error': f'Authentication error: {str(e)}'}), 500
-    
+            logger.error(f"Error validating token: {str(e)}")
+            
+            # Publish error event
+            publish_event('system_events', 'system.error', {
+                'event_type': 'system.error',
+                'service': 'api-gateway',
+                'operation': 'token_validation',
+                'error': str(e),
+                'trace_id': request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
+            })
+            
+            return jsonify({'success': False, 'error': f'Token validation error: {str(e)}'}), 500
+            
     return decorated
 
-# Function to format all responses to match JMeter expectations
-def format_response_for_jmeter(response):
-    """
-    Takes an API response and ensures it matches the format expected by JMeter:
-    {
-        "success": true/false,
-        "data": { ... original response content ... }
-    }
-    """
-    # Don't transform responses that are not JSON
-    if not response.is_json:
-        return response
-    
-    # Get the response data
-    response_data = response.get_json()
-    
-    # If the response already has a 'success' field at the top level, it's already correctly formatted
-    if 'success' in response_data:
-        return response
-        
-    # Create the transformed response
-    transformed_data = {
-        "success": response.status_code < 400,  # Success is true for HTTP 2xx and 3xx
-        "data": response_data
-    }
-    
-    # Create a new response with the transformed data
-    return jsonify(transformed_data), response.status_code
+def publish_login_event(user_info):
+    """Publish a user login event"""
+    try:
+        event_data = {
+            'event_type': 'user.login',
+            'user_id': user_info.get('id'),
+            'username': user_info.get('username'),
+            'account_type': user_info.get('account_type'),
+            'timestamp': datetime.now().isoformat()
+        }
+        publish_event('user_events', 'user.login', event_data)
+    except Exception as e:
+        logger.error(f"Failed to publish login event: {str(e)}")
 
-# Function to forward request to a service
+def format_response_for_jmeter(response):
+    """Format responses to match the expected JMeter format"""
+    try:
+        # Try to parse response as JSON
+        if isinstance(response, dict):
+            json_data = response
+        else:
+            json_data = response.json()
+            
+        # Check if response already has the correct structure
+        if 'success' in json_data and 'data' in json_data:
+            return json_data
+        
+        # Structure response in the format JMeter expects
+        if isinstance(response, requests.Response):
+            return {
+                "success": response.status_code < 400,
+                "data": json_data
+            }
+        else:
+            return {
+                "success": True,
+                "data": json_data
+            }
+    except Exception as e:
+        # If we can't parse as JSON, return as-is
+        logger.warning(f"Could not format response for JMeter: {str(e)}")
+        return response
+
 def forward_request(service_url, path, method='GET', headers=None, data=None, params=None):
+    """Forward a request to a backend service with event tracking"""
+    trace_id = request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
+    start_time = time.time()
+    service_name = service_url.split('://')[1].split(':')[0]
+    
     try:
         url = f"{service_url}{path}"
-        logger.info(f"Forwarding {method} request to {url}")
-        
-        # Add detailed path debugging
-        logger.debug(f"Path details - Original path: {path}")
+        logger.info(f"[TraceID: {trace_id}] Forwarding {method} request to {url}")
         
         # Prepare headers
         if headers is None:
             headers = {}
+        
+        # Add trace ID for request tracking
+        headers['X-Request-ID'] = trace_id
         
         # Remove host header to avoid conflicts
         if 'Host' in headers:
@@ -186,7 +401,6 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         service_host = service_url.replace('http://', '').replace('https://', '')
         # Set the host header properly for Django's host validation
         headers['Host'] = service_host
-        logger.debug(f"Setting Host header to: {service_host}")
         
         # Add X-REQUEST-FROM header to identify this as an internal service call
         headers['X-REQUEST-FROM'] = 'api-gateway'
@@ -203,7 +417,6 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                 params = dict(params) if params else {}
                 if 'user_id' not in params:
                     params['user_id'] = str(request.user_id)
-                    logger.debug(f"Added user_id={request.user_id} to query parameters")
             
             # For POST/PUT requests, include in data if not already there
             if method in ['POST', 'PUT'] and data is not None:
@@ -211,9 +424,6 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                     # Create a copy to avoid modifying the original
                     data = dict(data)
                     data['user_id'] = request.user_id
-                    logger.debug(f"Added user_id={request.user_id} to request body")
-            
-            logger.debug(f"Ensured user_id={request.user_id} is included in request")
             
         # Ensure proper content type headers for Django based on request method
         if method in ['POST', 'PUT', 'PATCH']:
@@ -236,34 +446,15 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             # Keep the Authorization header as it's already properly formatted
             # Also add token header for services that expect it
             headers['token'] = token
-            logger.debug("Found and extracted token from Authorization header")
-            
+        
         # Or use token header directly if Authorization not available
         elif 'token' in headers:
             token = headers['token']
             # Add the token to Authorization header for services that expect that format
             headers['Authorization'] = f"Bearer {token}"
-            logger.debug("Found token in token header, added to Authorization header")
         
-        if token:
-            logger.debug(f"Using token (first 10 chars): {token[:10]}...")
-            
-        # Add detailed debugging for headers
-        logger.debug("Request headers being sent:")
-        for key, value in headers.items():
-            # Only show first/last 10 chars of long values like tokens
-            value_log = value
-            if len(value) > 30 and (key.lower() == 'authorization' or key.lower() == 'token'):
-                value_log = f"{value[:10]}...{value[-10:]}"
-            logger.debug(f"  {key}: {value_log}")
-            
-        # Log the request data for debugging
-        if data:
-            logger.debug(f"Request data: {data}")
-            
         # Forward the request using our optimized session with connection pooling
         if method == 'GET':
-            logger.debug(f"Sending GET request without body data")
             response = http_session.request(
                 method=method,
                 url=url,
@@ -272,7 +463,6 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                 timeout=REQUEST_TIMEOUT
             )
         else:
-            logger.debug(f"Sending {method} request with JSON data")
             response = http_session.request(
                 method=method,
                 url=url,
@@ -282,74 +472,198 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                 timeout=REQUEST_TIMEOUT
             )
         
+        # Calculate request duration
+        duration = time.time() - start_time
+        
         # Log the response
-        logger.info(f"Response from {url}: {response.status_code}")
-        logger.debug(f"Response headers: {response.headers}")
+        logger.info(f"[TraceID: {trace_id}] Response from {url}: {response.status_code} in {duration:.2f}s")
+        
+        # Update service health based on response
+        update_service_health(service_name, response.status_code)
+        
+        # Publish request metrics event
+        publish_request_metrics(service_name, path, method, response.status_code, duration, trace_id)
         
         # Log more details on error responses
         if response.status_code >= 400:
-            logger.error(f"Error response from {url}: {response.status_code}")
+            logger.error(f"[TraceID: {trace_id}] Error response from {url}: {response.status_code}")
             logger.error(f"Response body: {response.text[:200]}...")
+            
+            # Publish error event
+            publish_event('system_events', 'api.request_error', {
+                'event_type': 'api.request_error',
+                'service': service_name,
+                'path': path,
+                'method': method,
+                'status_code': response.status_code,
+                'error': response.text[:500],
+                'trace_id': trace_id
+            })
         
         # Try to parse the response as JSON
         try:
             json_data = response.json()
             
             # Check if this response already has the correct structure
-            #if service_url == AUTH_SERVICE_URL and 'success' in json_data and 'data' in json_data:
             if 'success' in json_data and 'data' in json_data:
-                # For authentication service responses, preserve the original structure 
-                # (particularly important for JMeter tests)
                 return jsonify(json_data), response.status_code
             else:
-                # For other services, formating the response to match JMeter expectations
+                # Format the response to match JMeter expectations
                 return jsonify({
                     "success": response.status_code < 400,
                     "data": json_data
                 }), response.status_code
+                
         except ValueError:
             # Response is not JSON, return it as is
-            logger.warning(f"Non-JSON response from {url}: {response.text[:200]}")
+            logger.warning(f"[TraceID: {trace_id}] Non-JSON response from {url}: {response.text[:200]}")
             return response.content, response.status_code, {"Content-Type": response.headers.get("Content-Type", "text/plain")}
             
     except requests.exceptions.Timeout:
-        logger.error(f"Timeout when forwarding to {service_url}{path}")
+        # Request timed out
+        logger.error(f"[TraceID: {trace_id}] Timeout when forwarding to {service_url}{path}")
+        
+        # Update service health
+        update_service_health(service_name, 504, is_error=True)
+        
+        # Publish timeout event
+        publish_event('system_events', 'api.timeout', {
+            'event_type': 'api.timeout',
+            'service': service_name,
+            'path': path,
+            'method': method,
+            'duration': time.time() - start_time,
+            'trace_id': trace_id
+        })
+        
         return jsonify({
             "success": False,
             "data": {"error": "Service timeout"}
         }), 504
+        
     except requests.exceptions.ConnectionError:
-        logger.error(f"Connection error when forwarding to {service_url}{path}")
+        # Connection error
+        logger.error(f"[TraceID: {trace_id}] Connection error when forwarding to {service_url}{path}")
+        
+        # Update service health
+        update_service_health(service_name, 503, is_error=True)
+        
+        # Publish connection error event
+        publish_event('system_events', 'api.connection_error', {
+            'event_type': 'api.connection_error',
+            'service': service_name,
+            'path': path,
+            'method': method,
+            'trace_id': trace_id
+        })
+        
         return jsonify({
             "success": False,
             "data": {"error": "Service unavailable"}
         }), 503
+        
     except Exception as e:
-        logger.error(f"Error forwarding request to {service_url}{path}: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        # Unexpected error
+        logger.error(f"[TraceID: {trace_id}] Error forwarding request to {service_url}{path}: {str(e)}")
+        
+        # Publish error event
+        publish_event('system_events', 'system.error', {
+            'event_type': 'system.error',
+            'service': 'api-gateway',
+            'operation': 'forward_request',
+            'target_service': service_name,
+            'path': path,
+            'method': method,
+            'error': str(e),
+            'trace_id': trace_id
+        })
+        
         return jsonify({
             "success": False,
-            "data": {"error": f"Internal server error: {str(e)}"}
+            "data": {"error": f"Internal error: {str(e)}"}
         }), 500
+
+def update_service_health(service_name, status_code, is_error=False):
+    """Update service health status based on response"""
+    service_key = service_name.replace('_', '-')
+    
+    # If this is an unknown service, ignore it
+    if service_key not in service_health:
+        return
+        
+    # Update service health based on status code
+    if is_error or status_code >= 500:
+        service_health[service_key]['healthy'] = False
+        service_health[service_key]['failures'] += 1
+    else:
+        # Reset failures counter on success
+        service_health[service_key]['healthy'] = True
+        service_health[service_key]['failures'] = 0
+        
+    service_health[service_key]['last_checked'] = datetime.now().isoformat()
+    service_health[service_key]['last_status_code'] = status_code
+
+def publish_request_metrics(service, path, method, status_code, duration, trace_id):
+    """Publish request metrics event"""
+    try:
+        # Publish metrics event
+        publish_event('system_events', 'api.request', {
+            'event_type': 'api.request',
+            'service': service,
+            'path': path,
+            'method': method,
+            'status_code': status_code,
+            'duration': duration,
+            'trace_id': trace_id,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Failed to publish request metrics: {str(e)}")
 
 # Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "service": "api-gateway"})
+    # Get overall system health
+    all_healthy = all(service['healthy'] for service in service_health.values())
+    status = 'healthy' if all_healthy else 'degraded'
+    
+    # List unhealthy services
+    unhealthy_services = [name for name, data in service_health.items() if not data['healthy']]
+    
+    # Response data
+    response_data = {
+        "status": status,
+        "service": "api-gateway",
+        "services": service_health,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    # If any services are unhealthy, return 200 but with a degraded status
+    if not all_healthy:
+        response_data["unhealthy_services"] = unhealthy_services
+        
+    return jsonify(response_data)
 
-# Authentication routes
+# Auth service proxy
 @app.route('/authentication/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def auth_service_proxy(path):
     # Log the authentication request
-    logger.info(f"Authentication request: {request.method} {path}")
+    request_id = request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
+    logger.info(f"[TraceID: {request_id}] Authentication request: {request.method} /authentication/{path}")
     
+    # Check if the content type is application/json for POST/PUT requests
+    if request.method in ['POST', 'PUT'] and request.is_json:
+        data = request.get_json()
+    else:
+        data = None
+    
+    # Forward the request to the Auth Service
     return forward_request(
         service_url=AUTH_SERVICE_URL,
-        path=f"/authentication/{path}",
+        path=f"/{path}",
         method=request.method,
         headers=dict(request.headers),
-        data=request.get_json() if request.is_json else None,
+        data=data,
         params=request.args
     )
 
@@ -745,9 +1059,14 @@ def trading_debug_proxy(path):
 def catch_all(path):
     return jsonify({"success": False, "error": f"Endpoint '/{path}' not found"}), 404
 
+# Main application block
 if __name__ == '__main__':
     # Create logs directory if it doesn't exist
-    os.makedirs('logs', exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
     
-    # Run the app
-    app.run(host='0.0.0.0', port=5000, debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true') 
+    # Start health check thread and event consumers
+    delayed_start_health_check()
+    delayed_start_event_consumers()
+    
+    # Run the Flask app
+    app.run(host='0.0.0.0', port=5000) 
