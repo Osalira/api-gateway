@@ -13,6 +13,8 @@ import time
 import threading
 import uuid
 from rabbitmq import publish_event, start_consumer
+from flask_caching import Cache
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -28,9 +30,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create Flask app - MOVED UP before any app references
+# Configure Flask app and cache
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
+
+# Configure Redis cache
+cache_config = {
+    "DEBUG": False,
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_REDIS_HOST": os.getenv('REDIS_HOST', 'redis'),
+    "CACHE_REDIS_PORT": int(os.getenv('REDIS_PORT', 6379)),
+    "CACHE_REDIS_URL": os.getenv('REDIS_URL', 'redis://redis:6379/0'),
+    "CACHE_DEFAULT_TIMEOUT": 300,  # 5 minutes default
+    "CACHE_KEY_PREFIX": "api_gateway_"
+}
+app.config.update(cache_config)
+cache = Cache(app)
 
 # Configure CORS
 CORS(app)
@@ -42,7 +57,7 @@ MATCHING_ENGINE_URL = os.getenv('MATCHING_ENGINE_URL', 'http://matching-engine:8
 LOGGING_SERVICE_URL = os.getenv('LOGGING_SERVICE_URL', 'http://logging-service:5000')
 
 # Request timeout - Increased for high load scenarios
-REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 60))
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 120))  # Increased from 60 to 120 seconds
 
 # Rate limiting settings
 RATE_LIMIT_ENABLED = os.getenv('RATE_LIMIT_ENABLED', 'True').lower() == 'true'
@@ -62,6 +77,14 @@ service_health = {
     'logging-service': {'healthy': True, 'last_checked': datetime.now().isoformat(), 'failures': 0}
 }
 
+# Circuit breaker state (dictionary to track failures)
+service_circuit_breakers = {
+    'auth-service': {'failures': 0, 'open_until': 0},
+    'trading-service': {'failures': 0, 'open_until': 0},
+    'matching-engine': {'failures': 0, 'open_until': 0},
+    'logging-service': {'failures': 0, 'open_until': 0}
+}
+
 # Configure request session with connection pooling and retry logic
 def create_requests_session():
     session = requests.Session()
@@ -77,8 +100,8 @@ def create_requests_session():
     # Configure connection pooling
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
-        pool_connections=100,  # Number of connection pools
-        pool_maxsize=1000      # Max connections per pool
+        pool_connections=200,  # Increased from 100 for higher concurrency
+        pool_maxsize=2000      # Increased from 1000 for higher concurrency
     )
     
     # Mount the adapter for both http and https
@@ -376,11 +399,156 @@ def format_response_for_jmeter(response):
         logger.warning(f"Could not format response for JMeter: {str(e)}")
         return response
 
-def forward_request(service_url, path, method='GET', headers=None, data=None, params=None):
+# Circuit breaker function
+def check_circuit_breaker(service_name):
+    """Check if circuit breaker is open for the service"""
+    if not CIRCUIT_BREAKER_ENABLED:
+        return False  # Circuit breaker disabled
+    
+    circuit = service_circuit_breakers.get(service_name, {'failures': 0, 'open_until': 0})
+    
+    # Check if circuit breaker is open and not expired
+    if circuit['open_until'] > time.time():
+        logger.warning(f"Circuit breaker open for {service_name}, rejecting request")
+        return True  # Circuit is open, reject request
+    
+    # Circuit was open but timeout has expired, reset it
+    if circuit['open_until'] > 0 and circuit['open_until'] <= time.time():
+        logger.info(f"Circuit breaker for {service_name} half-open, allowing request")
+        circuit['failures'] = 0
+        circuit['open_until'] = 0
+        return False  # Allow request to test if service recovered
+    
+    return False  # Circuit is closed, allow request
+
+def record_service_failure(service_name):
+    """Record a failure and potentially open the circuit breaker"""
+    if not CIRCUIT_BREAKER_ENABLED:
+        return
+    
+    circuit = service_circuit_breakers.get(service_name)
+    if not circuit:
+        service_circuit_breakers[service_name] = {'failures': 1, 'open_until': 0}
+        return
+    
+    circuit['failures'] += 1
+    
+    # If failures exceed threshold, open the circuit
+    if circuit['failures'] >= CIRCUIT_BREAKER_THRESHOLD:
+        circuit['open_until'] = time.time() + CIRCUIT_BREAKER_TIMEOUT
+        logger.warning(f"Circuit breaker tripped for {service_name}. Open for {CIRCUIT_BREAKER_TIMEOUT} seconds")
+
+def record_service_success(service_name):
+    """Record a successful request to a service"""
+    if not CIRCUIT_BREAKER_ENABLED:
+        return
+    
+    circuit = service_circuit_breakers.get(service_name)
+    if circuit and circuit['failures'] > 0:
+        # Reset failures on success if circuit is half-open
+        if circuit['open_until'] <= time.time() and circuit['open_until'] > 0:
+            logger.info(f"Service {service_name} recovered, resetting circuit breaker")
+            circuit['failures'] = 0
+            circuit['open_until'] = 0
+
+# Define cache keys for different types of requests
+def generate_cache_key(service, path, method, params=None, data=None):
+    """Generate a cache key based on service, path, method and params."""
+    key_components = [service, path, method]
+    
+    # SECURITY ENHANCEMENT: Include user_id in cache key for secure endpoints
+    # This ensures different users don't see each other's cached data
+    user_id = None
+    
+    # Check if we have user_id in params (for GET requests)
+    if params and 'user_id' in params:
+        user_id = params.get('user_id')
+        logger.debug(f"Found user_id in params: {user_id}")
+    
+    # Check if we have user_id in data (for POST/PUT requests)
+    elif data and isinstance(data, dict) and 'user_id' in data:
+        user_id = data.get('user_id')
+        logger.debug(f"Found user_id in data: {user_id}")
+    
+    # For secure endpoints that should be user-specific, add user_id to the cache key
+    secure_endpoints = [
+        '/wallet/',
+        '/getWalletTransactions',
+        '/getStockTransactions',
+        '/getWalletBalance',
+        '/getStockPortfolio',
+        '/getQuoteServerStatus'
+    ]
+    
+    # Check if the current path matches any secure endpoint
+    is_secure_endpoint = any(path.startswith(endpoint) or path.startswith(endpoint + '/') for endpoint in secure_endpoints)
+    
+    # Add user_id to cache key for secure endpoints if available
+    if is_secure_endpoint and user_id:
+        key_components.append(f"user_{user_id}")
+        logger.debug(f"Added user_id {user_id} to cache key for secure endpoint {path}")
+    elif is_secure_endpoint and not user_id:
+        logger.warning(f"Secure endpoint {path} but no user_id available for cache key")
+    
+    # Original cache key logic
+    if params:
+        # Sort params to ensure consistent cache keys
+        sorted_params = sorted(params.items())
+        param_str = '&'.join(f"{k}={v}" for k, v in sorted_params)
+        key_components.append(param_str)
+    
+    if method == 'POST' and data and path in ['/validateToken', '/getQuote']:
+        # For specific POST endpoints, include hash of data
+        data_str = json.dumps(data, sort_keys=True)
+        data_hash = hashlib.md5(data_str.encode()).hexdigest()
+        key_components.append(data_hash)
+    
+    cache_key = '_'.join(key_components)
+    
+    # Debug log for specific paths we're having issues with
+    if path in ['/getWalletTransactions', '/getStockTransactions', '/getWalletBalance', '/getQuoteServerStatus', '/getStockPortfolio']:
+        logger.debug(f"CACHE KEY DEBUG - Path: {path}, Method: {method}, Has user_id: {user_id is not None}, Final cache key: {cache_key}")
+    
+    return cache_key
+
+def forward_request(service_url, path, method='GET', headers=None, data=None, params=None, timeout=None):
     """Forward a request to a backend service with event tracking"""
     trace_id = request.headers.get('X-Request-ID', uuid.uuid4().hex[:8])
     start_time = time.time()
     service_name = service_url.split('://')[1].split(':')[0]
+    
+    # Check circuit breaker before making request
+    if check_circuit_breaker(service_name):
+        return jsonify({
+            "success": False,
+            "data": {"error": f"Service {service_name} is unavailable due to circuit breaker"}
+        }), 503
+    
+    # Check if this request can be served from cache
+    is_cacheable = (method == 'GET' and not any(path.endswith(endpoint) for endpoint in [
+        '/getStockPortfolio/', 
+        '/getStockPortfolio',
+        '/getWalletTransactions/', 
+        '/getWalletTransactions',
+        '/getStockTransactions/', 
+        '/getStockTransactions',
+        '/getWalletBalance/', 
+        '/getWalletBalance'
+    ])) or (
+        method == 'POST' and path in [
+            '/transaction/quote',
+            '/transaction/summary',
+            # '/engine/stocks',
+            # clear
+        ]
+    )
+    
+    if is_cacheable:
+        cache_key = generate_cache_key(service_name, path, method, data, params)
+        cached_response = cache.get(cache_key)
+        if cached_response:
+            logger.info(f"[TraceID: {trace_id}] Cache hit for {method} {service_url}{path}")
+            return cached_response
     
     try:
         url = f"{service_url}{path}"
@@ -414,7 +582,7 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             
             # For GET requests, also include in query parameters if not already there
             if method == 'GET' and params is not None:
-                params = dict(params) if params else {}
+                params = dict(params)
                 if 'user_id' not in params:
                     params['user_id'] = str(request.user_id)
             
@@ -460,7 +628,7 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                 url=url,
                 headers=headers,
                 params=params,
-                timeout=REQUEST_TIMEOUT
+                timeout=timeout or REQUEST_TIMEOUT
             )
         else:
             response = http_session.request(
@@ -469,11 +637,14 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
                 headers=headers,
                 json=data,  # Use json parameter for JSON data on non-GET requests
                 params=params,
-                timeout=REQUEST_TIMEOUT
+                timeout=timeout or REQUEST_TIMEOUT
             )
         
         # Calculate request duration
         duration = time.time() - start_time
+        
+        # Record successful request for circuit breaker
+        record_service_success(service_name)
         
         # Log the response
         logger.info(f"[TraceID: {trace_id}] Response from {url}: {response.status_code} in {duration:.2f}s")
@@ -506,13 +677,30 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             
             # Check if this response already has the correct structure
             if 'success' in json_data and 'data' in json_data:
-                return jsonify(json_data), response.status_code
+                result = jsonify(json_data), response.status_code
             else:
                 # Format the response to match JMeter expectations
-                return jsonify({
+                result = jsonify({
                     "success": response.status_code < 400,
                     "data": json_data
                 }), response.status_code
+            
+            # Cache successful responses for cacheable requests
+            if is_cacheable and response.status_code < 400:
+                cache_timeout = 300  # 5 minutes default
+                
+                # Set different cache timeouts based on the endpoint
+                if path.endswith('/quote'):
+                    cache_timeout = 60  # 1 minute for quotes
+                elif path.endswith('/stocks'):
+                    cache_timeout = 600  # 10 minutes for stock listings
+                elif path.endswith('/validate-token'):
+                    cache_timeout = 1800  # 30 minutes for token validation
+                
+                cache.set(cache_key, result, timeout=cache_timeout)
+                logger.debug(f"[TraceID: {trace_id}] Cached response for {method} {service_url}{path} for {cache_timeout}s")
+            
+            return result
                 
         except ValueError:
             # Response is not JSON, return it as is
@@ -522,6 +710,9 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
     except requests.exceptions.Timeout:
         # Request timed out
         logger.error(f"[TraceID: {trace_id}] Timeout when forwarding to {service_url}{path}")
+        
+        # Record failure for circuit breaker
+        record_service_failure(service_name)
         
         # Update service health
         update_service_health(service_name, 504, is_error=True)
@@ -545,6 +736,9 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
         # Connection error
         logger.error(f"[TraceID: {trace_id}] Connection error when forwarding to {service_url}{path}")
         
+        # Record failure for circuit breaker
+        record_service_failure(service_name)
+        
         # Update service health
         update_service_health(service_name, 503, is_error=True)
         
@@ -565,6 +759,9 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
     except Exception as e:
         # Unexpected error
         logger.error(f"[TraceID: {trace_id}] Error forwarding request to {service_url}{path}: {str(e)}")
+        
+        # Record failure for circuit breaker
+        record_service_failure(service_name)
         
         # Publish error event
         publish_event('system_events', 'system.error', {
@@ -657,6 +854,12 @@ def auth_service_proxy(path):
     else:
         data = None
     
+    # Special handling for registration - longer timeout
+    if path == 'register' and request.method == 'POST':
+        timeout = int(os.getenv('REGISTRATION_TIMEOUT', 300))
+    else:
+        timeout = int(os.getenv('REQUEST_TIMEOUT', 120))
+    
     # Forward the request to the Auth Service
     return forward_request(
         service_url=AUTH_SERVICE_URL,
@@ -664,7 +867,8 @@ def auth_service_proxy(path):
         method=request.method,
         headers=dict(request.headers),
         data=data,
-        params=request.args
+        params=request.args,
+        timeout=timeout
     )
 
 # Transaction routes (require authentication)
@@ -697,11 +901,20 @@ def transaction_service_proxy(path):
     params = request.args.copy()
     if request.method == 'GET':
         data = None
+        # NEW: Log the original params before adding user_id
+        logger.debug(f"Original query parameters: {params}")
+        
         # For GET requests, add user_id as query parameter
         if hasattr(request, 'user_id'):
             params = dict(params)
             params['user_id'] = str(request.user_id)
             logger.debug(f"Added user_id to query parameters: {request.user_id}")
+            # NEW: Log the updated params after adding user_id
+            logger.debug(f"Final query parameters with user_id: {params}")
+        else:
+            # NEW: Log warning if no user_id is available
+            logger.warning(f"No user_id available for request to {path} - this may affect caching")
+        
         logger.debug("GET request - using query params only, no body data")
     
     # Construct the Django path correctly
