@@ -524,24 +524,8 @@ def forward_request(service_url, path, method='GET', headers=None, data=None, pa
             "data": {"error": f"Service {service_name} is unavailable due to circuit breaker"}
         }), 503
     
-    # Check if this request can be served from cache
-    is_cacheable = (method == 'GET' and not any(path.endswith(endpoint) for endpoint in [
-        '/getStockPortfolio/', 
-        '/getStockPortfolio',
-        '/getWalletTransactions/', 
-        '/getWalletTransactions',
-        '/getStockTransactions/', 
-        '/getStockTransactions',
-        '/getWalletBalance/', 
-        '/getWalletBalance'
-    ])) or (
-        method == 'POST' and path in [
-            '/transaction/quote',
-            '/transaction/summary',
-            # '/engine/stocks',
-            # clear
-        ]
-    )
+    # Determine if response should be cached
+    is_cacheable = False  # Disable all caching for load testing
     
     if is_cacheable:
         cache_key = generate_cache_key(service_name, path, method, data, params)
